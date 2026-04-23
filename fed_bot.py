@@ -288,7 +288,7 @@ def refresh_series(state: dict) -> list[tuple[Series, dict, dict]]:
 # Weekly digest (every Friday)
 # ---------------------------------------------------------------------------
 
-DIVIDER = "━━━━━━━━━━━━━━━━━━━"
+DIVIDER = ""
 
 CATEGORY_LABEL = {
     "1. Balance Sheet": "BALANCE SHEET",
