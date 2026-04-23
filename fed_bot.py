@@ -87,50 +87,46 @@ def _arrow(delta: float) -> str:
     return "▲" if delta >= 0 else "▼"
 
 
-def _trend(positive: bool) -> str:
-    return "📈" if positive else "📉"
-
-
 def balance_sheet_signal(new: float, old: float) -> str:
     delta = new - old
     pct   = delta / old * 100
     label = "Fed expanding" if delta > 0 else "Fed shrinking (QT)"
-    return f"{_trend(delta > 0)} {label} ({_arrow(delta)}{fmt_trillions(abs(delta))}, {pct:+.2f}%)"
+    return f"{label} ({_arrow(delta)}{fmt_trillions(abs(delta))}, {pct:+.2f}%)"
 
 
 def reserves_signal(new: float, old: float) -> str:
     delta = new - old
     pct   = delta / old * 100
     label = "Reserves rising, more system liquidity" if delta > 0 else "Reserves draining, tighter liquidity"
-    return f"{_trend(delta > 0)} {label} ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
+    return f"{label} ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
 
 
 def rrp_signal(new: float, old: float) -> str:
     delta = new - old
     pct   = delta / old * 100 if old else 0
     if delta > 0:
-        return f"{_trend(False)} ON RRP rising, liquidity being drained ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
-    return f"{_trend(True)} ON RRP falling, liquidity returning to system ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
+        return f"ON RRP rising, liquidity being drained ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
+    return f"ON RRP falling, liquidity returning to system ({_arrow(delta)}{fmt_billions(abs(delta))}, {pct:+.2f}%)"
 
 
 def rate_signal(new: float, old: float) -> str:
     delta = new - old
     if delta < 0:
-        return f"{_trend(True)} Fed cut by {abs(delta):.2f}pp → {new:.2f}%"
+        return f"Fed cut by {abs(delta):.2f}pp → {new:.2f}%"
     if delta > 0:
-        return f"{_trend(False)} Fed hiked by {delta:.2f}pp → {new:.2f}%"
-    return "➡️ Unchanged"
+        return f"Fed hiked by {delta:.2f}pp → {new:.2f}%"
+    return "Unchanged"
 
 
 def yield_curve_signal(new: float, old: float) -> str:
     delta = new - old
     if old < 0 and new >= 0:
-        return f"{_trend(True)} Uninverted — {old:.2f}% → {new:.2f}%"
+        return f"Uninverted — {old:.2f}% → {new:.2f}%"
     if old >= 0 and new < 0:
-        return f"{_trend(False)} Inverted — {old:.2f}% → {new:.2f}%"
+        return f"Inverted — {old:.2f}% → {new:.2f}%"
     direction = "Steepening" if delta > 0 else "Flattening"
     sign = "+" if delta >= 0 else ""
-    return f"{_trend(delta > 0)} {direction} ({sign}{delta:.2f}pp)"
+    return f"{direction} ({sign}{delta:.2f}pp)"
 
 
 def payrolls_signal(new: float, old: float) -> str:
@@ -143,18 +139,18 @@ def payrolls_signal(new: float, old: float) -> str:
         tone = "Weak print"
     else:
         tone = "Job losses"
-    return f"{_trend(new > 100)} {tone} ({_arrow(delta)}{abs(delta):,.0f}K vs prior)"
+    return f"{tone} ({_arrow(delta)}{abs(delta):,.0f}K vs prior)"
 
 
 def unrate_signal(new: float, old: float) -> str:
     delta = new - old
     if delta > 0.3:
-        return f"{_trend(False)} Rising sharply {old:.1f}% → {new:.1f}%"
+        return f"Rising sharply {old:.1f}% → {new:.1f}%"
     if delta > 0:
-        return f"{_trend(False)} Ticking up {old:.1f}% → {new:.1f}%"
+        return f"Ticking up {old:.1f}% → {new:.1f}%"
     if delta < -0.3:
-        return f"{_trend(True)} Falling sharply {old:.1f}% → {new:.1f}%"
-    return f"{_trend(True)} Improving {old:.1f}% → {new:.1f}%"
+        return f"Falling sharply {old:.1f}% → {new:.1f}%"
+    return f"Improving {old:.1f}% → {new:.1f}%"
 
 
 SERIES_CONFIG: list[Series] = [
@@ -341,10 +337,10 @@ def _format_entry(series: "Series", obs: dict, last: dict) -> str:
 
     hist = _history_lines(series.id, obs["date"])
     body = f"<b>{series.label}</b>\n{series.fmt(new_val)}  ·  {date_str}"
-    if sig:
-        body += f"\n{sig}"
     if hist:
         body += f"\n{hist}"
+    if sig:
+        body += f"\n\n{sig}"
     return body
 
 
