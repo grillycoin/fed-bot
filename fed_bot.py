@@ -187,7 +187,20 @@ def load_state() -> dict:
             timeout=10,
         )
         result = r.json().get("result")
-        return json.loads(result) if result else {}
+        if not result:
+            return {}
+        # Unwrap nested JSON layers accumulated from old save bug
+        data = result
+        for _ in range(20):
+            try:
+                parsed = json.loads(data)
+                if isinstance(parsed, dict) and "value" in parsed and "current" not in parsed and "month_snapshot" not in parsed:
+                    data = parsed["value"]
+                else:
+                    return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                break
+        return {}
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return {}
@@ -195,10 +208,11 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     if UPSTASH_URL:
+        # Store raw JSON string — no extra wrapping
         requests.post(
             f"{UPSTASH_URL}/set/{REDIS_KEY}",
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-            json={"value": json.dumps(state)},
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "text/plain"},
+            data=json.dumps(state),
             timeout=10,
         )
         return
@@ -418,91 +432,151 @@ def is_last_day_of_month(d: date) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# FedWatch probabilities (pyfedwatch + yfinance)
+# FedWatch probabilities — direct CME methodology
 # ---------------------------------------------------------------------------
+
+# All FOMC meeting months in 2026-2027 (used to identify no-FOMC anchor months).
+# Must include meetings beyond the 5 we display so anchors are correctly skipped.
+_ALL_FOMC_MONTHS: set[tuple[int, int]] = {
+    (2026, 1), (2026, 3), (2026, 5), (2026, 6), (2026, 7),
+    (2026, 9), (2026, 11), (2026, 12),
+    (2027, 1), (2027, 3), (2027, 5), (2027, 6),
+}
+
+# ZQ futures CME month codes
+_ZQ_CODES = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',7:'N',8:'Q',9:'U',10:'V',11:'X',12:'Z'}
+
+
+def fetch_effr() -> float | None:
+    """Latest Effective Federal Funds Rate from FRED (CME uses this, not target midpoint)."""
+    obs = fetch_observations("DFF", limit=3)
+    return float(obs[0]["value"]) if obs else None
+
+
+def _zq_rate(year: int, month: int, fallback: float) -> float:
+    """Live implied rate for a ZQ futures contract via Yahoo Finance fast_info."""
+    try:
+        import warnings; warnings.filterwarnings("ignore")
+        import yfinance as yf
+        sym = f"ZQ{_ZQ_CODES[month]}{str(year)[-2:]}.CBT"
+        price = yf.Ticker(sym).fast_info.last_price
+        if price:
+            return 100.0 - float(price)
+    except Exception:
+        pass
+    return fallback
+
 
 def fetch_fedwatch() -> str | None:
     """
-    Estimate Fed rate cut probability from Fed Funds Futures (ZQ) via yfinance.
-    Uses the standard FedWatch methodology: price = 100 - implied avg FF rate.
+    Direct CME FedWatch calculation:
+      • Uses EFFR (not target midpoint) as the starting rate
+      • Uses live ZQ prices via yfinance fast_info
+      • Uses no-FOMC month contracts as rate anchors (matches CME anchoring)
+      • Cascades binary probabilities for cumulative output
     """
     try:
-        import warnings
-        warnings.filterwarnings("ignore")
-        import yfinance as yf
-        from datetime import date
-        import calendar as cal
+        import math
+        import numpy as np
+        from calendar import monthrange
+        from dateutil.relativedelta import relativedelta
 
-        # FOMC 2026 meeting dates
-        fomc_dates = [
-            date(2026, 6, 18),
-            date(2026, 7, 29),
-            date(2026, 9, 16),
-            date(2026, 11, 5),
-            date(2026, 12, 16),
+        state  = load_state()
+        lower  = float(state.get("current", {}).get("DFEDTARL", {}).get("value", 3.50))
+        upper  = float(state.get("current", {}).get("DFEDTARU", {}).get("value", 3.75))
+        effr   = fetch_effr() or (lower + upper) / 2
+        print(f"  [FedWatch] EFFR={effr}%  target={lower}-{upper}%")
+
+        # Next 5 upcoming FOMC meetings (after today)
+        today = datetime.today()
+        all_fomc = [
+            datetime(2026, 6, 18), datetime(2026, 7, 29), datetime(2026, 9, 16),
+            datetime(2026, 11,  5), datetime(2026, 12, 16),
+            datetime(2027,  1, 28), datetime(2027,  3, 17),
         ]
+        upcoming = [d for d in all_fomc if d > today][:5]
 
-        today = date.today()
-        upcoming = [d for d in fomc_dates if d >= today][:2]
-        if not upcoming:
+        def _no_fomc_anchor(after: datetime, before: datetime | None) -> tuple[int, int] | None:
+            """First no-FOMC month strictly after `after` and strictly before `before`."""
+            m = datetime(after.year, after.month, 1) + relativedelta(months=1)
+            end = datetime(before.year, before.month, 1) if before else datetime(2028, 1, 1)
+            while m < end:
+                if (m.year, m.month) not in _ALL_FOMC_MONTHS:
+                    return (m.year, m.month)
+                m += relativedelta(months=1)
             return None
 
-        # ZQ month codes
-        month_codes = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',
-                       7:'N',8:'Q',9:'U',10:'V',11:'X',12:'Z'}
+        # Build per-meeting binary hike info
+        rate_before  = effr
+        meeting_data = []
 
-        # Current midpoint rate
-        state = load_state()
-        lower = float(state.get("current", {}).get("DFEDTARL", {}).get("value", 3.50))
-        upper = float(state.get("current", {}).get("DFEDTARU", {}).get("value", 3.75))
-        current_rate = (lower + upper) / 2
+        for i, meeting in enumerate(upcoming):
+            yr, mn, day = meeting.year, meeting.month, meeting.day
+            days = monthrange(yr, mn)[1]
+            n    = day - 1        # days before meeting
+            m    = days - day + 1 # days from meeting (inclusive) to month end
 
-        lines = []
-        for meeting in upcoming:
-            m, y = meeting.month, meeting.year
-            ticker = f"ZQ{month_codes[m]}{str(y)[-2:]}.CBT"
-            hist = yf.Ticker(ticker).history(period="5d")
-            if hist.empty:
-                continue
+            next_meeting = upcoming[i + 1] if i + 1 < len(upcoming) else None
+            anchor       = _no_fomc_anchor(meeting, next_meeting)
 
-            price       = hist['Close'].iloc[-1]
-            implied_avg = 100 - price
-            days_total  = cal.monthrange(y, m)[1]
-            days_before = meeting.day - 1
-            days_after  = days_total - days_before
-
-            # Solve for post-meeting rate
-            # implied_avg = (days_before * current_rate + days_after * new_rate) / days_total
-            new_rate = (implied_avg * days_total - days_before * current_rate) / days_after
-
-            delta_bps = round((new_rate - current_rate) * 100 / 25) * 25  # round to nearest 25bp
-
-            # Probability of each outcome
-            outcomes = {0: 0.0, -25: 0.0, -50: 0.0, 25: 0.0}
-            if -25 <= delta_bps <= 0:
-                p_cut = max(0, min(1, (current_rate - new_rate) / 0.25))
-                outcomes[-25] = p_cut
-                outcomes[0]   = 1 - p_cut
-            elif delta_bps < -25:
-                p_cut50 = max(0, min(1, (current_rate - new_rate - 0.25) / 0.25))
-                outcomes[-50] = p_cut50
-                outcomes[-25] = 1 - p_cut50
+            if anchor:
+                # Use no-FOMC anchor month contract as post-meeting rate
+                rate_after = _zq_rate(*anchor, fallback=effr)
             else:
-                outcomes[0] = 1.0
+                # Consecutive FOMC months — solve rate_after from this month's contract
+                rate_avg   = _zq_rate(yr, mn, fallback=effr)
+                rate_after = (rate_avg * days - n * rate_before) / m
 
-            date_str = meeting.strftime("%b %d")
-            lines.append(f"<b>FOMC {date_str}</b>")
-            for bps, prob in sorted(outcomes.items(), key=lambda x: -x[1]):
-                if prob < 0.01:
+            change = (rate_after - rate_before) / 0.25   # in 25 bp units
+            h0 = math.trunc(change) * 25
+            h1 = h0 + (25 if change >= 0 else -25)
+            p1 = abs(change) - math.trunc(abs(change))
+            p0 = 1.0 - p1
+
+            meeting_data.append({
+                "date":  meeting,
+                "sizes": np.array([h0, h1]),
+                "probs": np.array([p0, p1]),
+            })
+            print(f"  [FedWatch] {meeting.strftime('%b %d')}: {rate_before:.4f}% → {rate_after:.4f}%  ({change:+.3f}×25bp)  Hold={p0*100:.1f}%")
+            rate_before = rate_after
+
+        # Cascade binary probabilities → cumulative per-meeting distribution
+        cum_sizes: np.ndarray | None = None
+        cum_probs: np.ndarray | None = None
+        lines: list[str] = []
+
+        for info in meeting_data:
+            if cum_sizes is None:
+                cum_sizes = info["sizes"]
+                cum_probs = info["probs"]
+            else:
+                flat_s = (cum_sizes[:, np.newaxis] + info["sizes"]).flatten()
+                flat_p = (cum_probs[:, np.newaxis] * info["probs"]).flatten()
+                u, idx = np.unique(flat_s, return_inverse=True)
+                cum_sizes = u
+                cum_probs = np.bincount(idx, weights=flat_p)
+
+            d = info["date"].strftime("%b %d")
+            lines.append(f"<b>FOMC {d}</b>")
+            for bp, prob in sorted(zip(cum_sizes.tolist(), cum_probs.tolist()), key=lambda x: -x[1]):
+                if prob < 0.005:
                     continue
-                label = "Hold" if bps == 0 else (f"Cut {abs(bps)}bp" if bps < 0 else f"Hike {bps}bp")
-                lines.append(f"  {label:<12} {prob*100:.0f}%")
+                bp = round(bp)
+                if bp == 0:
+                    label = "Hold"
+                elif bp > 0:
+                    label = f"Hike {bp}bp"
+                else:
+                    label = f"Cut {abs(bp)}bp"
+                lines.append(f"  {label:<12} {prob * 100:.0f}%")
             lines.append("")
 
         return "\n".join(lines).strip() if lines else None
 
     except Exception as e:
         print(f"  [FedWatch] Error: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -524,19 +598,6 @@ def build_rates_message(state: dict, now_str: str) -> str:
             f"<b>Fed Funds Target</b>\n"
             f"{fmt_pct(float(lower['value']))} – {fmt_pct(float(upper['value']))}  ·  {d}"
         )
-
-    # Yield curve
-    t10y3m = current.get("T10Y3M", {})
-    t10y2y = current.get("T10Y2Y", {})
-    if t10y3m:
-        d = datetime.strptime(t10y3m["date"], "%Y-%m-%d").strftime("%b %d")
-        val = float(t10y3m["value"])
-        status = "Inverted ⚠️" if val < 0 else "Normal"
-        parts.append(f"\n<b>Yield Curve 10Y−3M</b>\n{fmt_pct(val)}  ·  {d}  ({status})")
-    if t10y2y:
-        d = datetime.strptime(t10y2y["date"], "%Y-%m-%d").strftime("%b %d")
-        val = float(t10y2y["value"])
-        parts.append(f"\n<b>Yield Curve 10Y−2Y</b>\n{fmt_pct(val)}  ·  {d}")
 
     # FedWatch
     fw = fetch_fedwatch()
