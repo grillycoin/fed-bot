@@ -418,6 +418,147 @@ def is_last_day_of_month(d: date) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# FedWatch probabilities (pyfedwatch + yfinance)
+# ---------------------------------------------------------------------------
+
+def fetch_fedwatch() -> str | None:
+    """
+    Estimate Fed rate cut probability from Fed Funds Futures (ZQ) via yfinance.
+    Uses the standard FedWatch methodology: price = 100 - implied avg FF rate.
+    """
+    try:
+        import warnings
+        warnings.filterwarnings("ignore")
+        import yfinance as yf
+        from datetime import date
+        import calendar as cal
+
+        # FOMC 2026 meeting dates
+        fomc_dates = [
+            date(2026, 6, 18),
+            date(2026, 7, 29),
+            date(2026, 9, 16),
+            date(2026, 11, 5),
+            date(2026, 12, 16),
+        ]
+
+        today = date.today()
+        upcoming = [d for d in fomc_dates if d >= today][:2]
+        if not upcoming:
+            return None
+
+        # ZQ month codes
+        month_codes = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',
+                       7:'N',8:'Q',9:'U',10:'V',11:'X',12:'Z'}
+
+        # Current midpoint rate
+        state = load_state()
+        lower = float(state.get("current", {}).get("DFEDTARL", {}).get("value", 3.50))
+        upper = float(state.get("current", {}).get("DFEDTARU", {}).get("value", 3.75))
+        current_rate = (lower + upper) / 2
+
+        lines = []
+        for meeting in upcoming:
+            m, y = meeting.month, meeting.year
+            ticker = f"ZQ{month_codes[m]}{str(y)[-2:]}.CBT"
+            hist = yf.Ticker(ticker).history(period="5d")
+            if hist.empty:
+                continue
+
+            price       = hist['Close'].iloc[-1]
+            implied_avg = 100 - price
+            days_total  = cal.monthrange(y, m)[1]
+            days_before = meeting.day - 1
+            days_after  = days_total - days_before
+
+            # Solve for post-meeting rate
+            # implied_avg = (days_before * current_rate + days_after * new_rate) / days_total
+            new_rate = (implied_avg * days_total - days_before * current_rate) / days_after
+
+            delta_bps = round((new_rate - current_rate) * 100 / 25) * 25  # round to nearest 25bp
+
+            # Probability of each outcome
+            outcomes = {0: 0.0, -25: 0.0, -50: 0.0, 25: 0.0}
+            if -25 <= delta_bps <= 0:
+                p_cut = max(0, min(1, (current_rate - new_rate) / 0.25))
+                outcomes[-25] = p_cut
+                outcomes[0]   = 1 - p_cut
+            elif delta_bps < -25:
+                p_cut50 = max(0, min(1, (current_rate - new_rate - 0.25) / 0.25))
+                outcomes[-50] = p_cut50
+                outcomes[-25] = 1 - p_cut50
+            else:
+                outcomes[0] = 1.0
+
+            date_str = meeting.strftime("%b %d")
+            lines.append(f"<b>FOMC {date_str}</b>")
+            for bps, prob in sorted(outcomes.items(), key=lambda x: -x[1]):
+                if prob < 0.01:
+                    continue
+                label = "Hold" if bps == 0 else (f"Cut {abs(bps)}bp" if bps < 0 else f"Hike {bps}bp")
+                lines.append(f"  {label:<12} {prob*100:.0f}%")
+            lines.append("")
+
+        return "\n".join(lines).strip() if lines else None
+
+    except Exception as e:
+        print(f"  [FedWatch] Error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Wednesday rates update
+# ---------------------------------------------------------------------------
+
+def build_rates_message(state: dict, now_str: str) -> str:
+    current  = state.get("current", {})
+    date_str = datetime.now(ET).strftime("%a, %b %d %Y")
+    parts    = [f"🎯 <b>Fed Rates Update</b>\n<i>{date_str}</i>\n"]
+
+    # Current rate
+    lower = current.get("DFEDTARL", {})
+    upper = current.get("DFEDTARU", {})
+    if lower and upper:
+        d = datetime.strptime(lower["date"], "%Y-%m-%d").strftime("%b %d")
+        parts.append(
+            f"<b>Fed Funds Target</b>\n"
+            f"{fmt_pct(float(lower['value']))} – {fmt_pct(float(upper['value']))}  ·  {d}"
+        )
+
+    # Yield curve
+    t10y3m = current.get("T10Y3M", {})
+    t10y2y = current.get("T10Y2Y", {})
+    if t10y3m:
+        d = datetime.strptime(t10y3m["date"], "%Y-%m-%d").strftime("%b %d")
+        val = float(t10y3m["value"])
+        status = "Inverted ⚠️" if val < 0 else "Normal"
+        parts.append(f"\n<b>Yield Curve 10Y−3M</b>\n{fmt_pct(val)}  ·  {d}  ({status})")
+    if t10y2y:
+        d = datetime.strptime(t10y2y["date"], "%Y-%m-%d").strftime("%b %d")
+        val = float(t10y2y["value"])
+        parts.append(f"\n<b>Yield Curve 10Y−2Y</b>\n{fmt_pct(val)}  ·  {d}")
+
+    # FedWatch
+    fw = fetch_fedwatch()
+    if fw:
+        parts.append(f"\n<b>FedWatch — Market Probabilities</b>\n{fw}")
+
+    return "\n".join(parts)
+
+
+def run_rates():
+    """Wednesday rates-only update."""
+    print(f"[{datetime.now().isoformat()}] Rates update...")
+    state   = load_state()
+    refresh_series(state)
+    save_state(state)
+    now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+    msg     = build_rates_message(state, now_str)
+    send_telegram(msg)
+    print("Rates update sent.")
+
+
+# ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
 
@@ -474,6 +615,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fed macro signal bot")
     parser.add_argument("--weekly",  action="store_true", help="Force weekly digest")
     parser.add_argument("--monthly", action="store_true", help="Force monthly overview")
+    parser.add_argument("--rates",   action="store_true", help="Wednesday rates update")
     parser.add_argument("--daemon",  action="store_true", help="Run on daily schedule")
     args = parser.parse_args()
 
@@ -481,6 +623,8 @@ if __name__ == "__main__":
     try:
         if args.daemon:
             run_daemon()
+        elif args.rates:
+            run_rates()
         else:
             run(force_weekly=args.weekly, force_monthly=args.monthly)
     except Exception as e:

@@ -1,11 +1,30 @@
 services:
   - type: cron
-    name: fed-macro-bot
+    name: fed-macro-bot-weekly
     runtime: python
     plan: free
-    schedule: "0 16 * * 5"    # 16:00 UTC = 6 PM CET (winter) / 6 PM CEST (summer) — Fridays only
+    schedule: "0 16 * * 5"    # Fridays 16:00 UTC = 6 PM CET — full digest
     buildCommand: pip install -r requirements.txt
     startCommand: python fed_bot.py
+    envVars:
+      - key: FRED_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+
+  - type: cron
+    name: fed-macro-bot-rates
+    runtime: python
+    plan: free
+    schedule: "0 16 * * 3"    # Wednesdays 16:00 UTC = 6 PM CET — rates update
+    buildCommand: pip install -r requirements.txt
+    startCommand: python fed_bot.py --rates
     envVars:
       - key: FRED_API_KEY
         sync: false
